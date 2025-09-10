@@ -1,32 +1,53 @@
-from fastapi import FastAPI, Depends, Query
+from fastapi import FastAPI, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from database import get_db
 from typing import List, Optional
+from .database import get_db
 
 
-app = FastAPI(title="Dubai Population API", version="1.0")
+app = FastAPI(
+    title="Dubai Population Analytics API",
+    description="Senior Data Engineer Technical Assessment - Dubai Population Data",
+    version="1.0.0"
+)
 
 
 @app.get("/")
 async def root():
     return {
-        "message": "Dubai Population API - Check /docs for endpoints"
+        "message": "Dubai Population Analytics API",
+        "endpoints": {
+            "emirate_data": "/api/emirate",
+            "sector_data": "/api/sectors/{sector_name}",
+            "community_data": "/api/communities/{community_code}",
+            "anomalies": "/api/anomalies"
+        }
     }
 
 
-@app.get("/population/emirate")
-async def get_emirate_population(
-    years: Optional[List[int]] = Query(None),
+@app.get("/health")
+async def health_check(db: Session = Depends(get_db)):
+    """Health check endpoint for Docker healthcheck"""
+
+    try:
+        db.execute(text("SELECT 1"))
+        return {"status": "healthy", "database": "connected"}
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Database connection failed: {e}"
+        )
+
+
+@app.get("/api/emirate")
+async def get_emirate_data(
+    years: Optional[List[int]] = Query(None, description="Filter by years"),
     db: Session = Depends(get_db)
 ):
-    query = """
-    SELECT year, SUM(population) as total_population, 
-           ROUND(SUM(population) / SUM(area_km2), 2) as density
-    FROM population_data pd
-    JOIN communities c ON pd.community_id = c.id
-    GROUP BY year
-    """
+    """Get population data for entire Dubai emirate"""
+
+    query = "SELECT * FROM analytics.emirate_population"
     if years:
         query += f" WHERE year IN ({','.join(map(str, years))})"
     query += " ORDER BY year"
@@ -35,80 +56,76 @@ async def get_emirate_population(
     return [dict(row) for row in result.mappings()]
 
 
-@app.get("/population/sector/{sector_name}")
-async def get_sector_population(
+@app.get("/api/sectors/{sector_name}")
+async def get_sector_data(
     sector_name: str,
     years: Optional[List[int]] = Query(None),
     db: Session = Depends(get_db)
 ):
+    """Get population data for specific sector"""
+
     query = """
-    SELECT s.name as sector_name, pd.year, 
-           SUM(pd.population) as total_population,
-           ROUND(SUM(pd.population) / SUM(c.area_km2), 2) as density
-    FROM population_data pd
-    JOIN communities c ON pd.community_id = c.id
-    JOIN sectors s ON c.sector_id = s.id
-    WHERE s.name = :sector_name
+    SELECT * FROM analytics.sector_population 
+    WHERE sector_name_en = :sector_name
     """
     if years:
-        query += f" AND pd.year IN ({','.join(map(str, years))})"
-    query += " GROUP BY s.name, pd.year ORDER BY pd.year"
+        query += f" AND year IN ({','.join(map(str, years))})"
+    query += " ORDER BY year"
     
     result = db.execute(text(query), {"sector_name": sector_name})
-    return [dict(row) for row in result.mappings()]
+    data = [dict(row) for row in result.mappings()]
+    
+    if not data:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Sector '{sector_name}' not found"
+        )
+    
+    return data
 
 
-@app.get("/population/community/{community_name}")
-async def get_community_population(
-    community_name: str,
+@app.get("/api/communities/{community_code}")
+async def get_community_data(
+    community_code: str,
     years: Optional[List[int]] = Query(None),
     db: Session = Depends(get_db)
 ):
+    """Get population data for specific community"""
+
     query = """
-    SELECT c.name as community_name, s.name as sector_name, 
-           pd.year, pd.population, 
-           ROUND(pd.population / c.area_km2, 2) as density,
-           pd.is_estimated
-    FROM population_data pd
-    JOIN communities c ON pd.community_id = c.id
-    JOIN sectors s ON c.sector_id = s.id
-    WHERE c.name = :community_name
+    SELECT * FROM analytics.community_population 
+    WHERE community_code = :community_code
     """
     if years:
-        query += f" AND pd.year IN ({','.join(map(str, years))})"
-    query += " ORDER BY pd.year"
+        query += f" AND year IN ({','.join(map(str, years))})"
+    query += " ORDER BY year"
     
-    result = db.execute(text(query), {"community_name": community_name})
-    return [dict(row) for row in result.mappings()]
+    result = db.execute(text(query), {"community_code": community_code})
+    data = [dict(row) for row in result.mappings()]
+    
+    if not data:
+        raise HTTPException(status_code=404, detail=f"Community '{community_code}' not found")
+    
+    return data
 
 
-@app.get("/anomalies")
+@app.get("/api/anomalies")
 async def get_anomalies(
-    threshold: float = 1.5,
+    severity_threshold: float = Query(0.7, ge=0.0, le=1.0),
+    resolved: bool = Query(False),
     db: Session = Depends(get_db)
 ):
+    """Get detected population anomalies"""
+
     query = """
-    WITH growth_rates AS (
-        SELECT 
-            c.name as community,
-            pd.year,
-            pd.population,
-            LAG(pd.population) OVER (PARTITION BY c.id ORDER BY pd.year) as prev_population,
-            (pd.population - LAG(pd.population) OVER (PARTITION BY c.id ORDER BY pd.year)) * 100.0 / 
-            NULLIF(LAG(pd.population) OVER (PARTITION BY c.id ORDER BY pd.year), 0) as growth_rate
-        FROM population_data pd
-        JOIN communities c ON pd.community_id = c.id
-    )
-    SELECT community, year, population, growth_rate
-    FROM growth_rates
-    WHERE growth_rate IS NOT NULL AND ABS(growth_rate) > :threshold
-    ORDER BY ABS(growth_rate) DESC
+    SELECT * FROM analytics.population_anomalies_report 
+    WHERE severity_score >= :threshold AND is_resolved = :resolved
+    ORDER BY detected_at DESC
     """
     
-    result = db.execute(text(query), {"threshold": threshold})
+    result = db.execute(text(query), {
+        "threshold": severity_threshold,
+        "resolved": resolved
+    })
+    
     return [dict(row) for row in result.mappings()]
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
